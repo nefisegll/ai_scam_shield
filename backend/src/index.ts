@@ -1,0 +1,264 @@
+import 'dotenv/config'
+import cors from 'cors'
+import express, { type Request, type Response } from 'express'
+import multer from 'multer'
+import {
+  adjustScamTypeForBalancedAnalysis,
+  applyCorporateTrustCap,
+  filterWeakMisleadingReasons,
+  shouldApplyCorporateTrustCap,
+  syncRiskLevelFromScore,
+} from './services/analysisPostProcess'
+import {
+  analyzeScamImage,
+  isGeminiQuotaOrRateLimitError,
+  testGeminiConnection,
+} from './services/gemini'
+import { analyzeUrlForQr, normalizeHttpUrlInput } from './services/analyzeUrlQr'
+import { sendFamilyAlertEmail } from './services/mailService'
+import { checkUrlsWithSafeBrowsing } from './services/safeBrowsing'
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024 },
+})
+
+const app = express()
+const port = Number(process.env.PORT) || 5000
+
+app.use(cors())
+app.use(express.json())
+
+app.get('/health', (_req: Request, res: Response) => {
+  res.json({
+    status: 'ok',
+    service: 'AI Scam Shield Backend',
+  })
+})
+
+app.get('/api/test-gemini', async (_req: Request, res: Response) => {
+  try {
+    await testGeminiConnection()
+    res.json({
+      success: true,
+      message: 'AI Scam Shield connection successful',
+    })
+  } catch (error) {
+    console.error('Gemini test error:', error)
+    console.error('Gemini test error details:', error)
+    if (error instanceof Error) {
+      console.error('Gemini error message:', error.message)
+    }
+    res.status(500).json({
+      success: false,
+      error: 'Gemini connection failed',
+    })
+  }
+})
+
+app.get('/api/test-mail', async (req: Request, res: Response) => {
+  const rawTo = req.query.to
+  const to = typeof rawTo === 'string' ? rawTo.trim() : ''
+  if (to === '') {
+    res.status(400).json({
+      success: false,
+      error: 'Missing recipient email',
+    })
+    return
+  }
+
+  try {
+    await sendFamilyAlertEmail({
+      to,
+      userFullName: 'Test Kullanıcı',
+      riskScore: 95,
+      riskLevel: 'Yüksek Risk',
+      scamType: 'Phishing',
+      reasons: [
+        'Şüpheli bağlantı tespit edildi.',
+        'Kullanıcıdan hızlı işlem yapması isteniyor.',
+      ],
+      analyzedUrl: 'https://example-scam-site.com',
+      elderlyExplanation:
+        'Bu bağlantı güvenli görünmüyor. Linke tıklamadan önce bir yakınına danış.',
+    })
+    res.json({
+      success: true,
+      message: 'Test email sent',
+    })
+  } catch (error) {
+    console.error('Test mail error:', error)
+    res.status(500).json({
+      success: false,
+      error: 'Test email failed',
+    })
+  }
+})
+
+app.post('/api/notify-family', async (req: Request, res: Response) => {
+  console.log("REAL notify-family endpoint called")
+  console.log("Notify body:", req.body)
+  console.log("Notify family recipient:", req.body?.to)
+
+  const {
+    to,
+    userFullName,
+    riskScore,
+    riskLevel,
+    scamType,
+    reasons,
+    analyzedUrl,
+    elderlyExplanation,
+  } = req.body
+
+  if (
+    !to ||
+    !userFullName ||
+    riskScore == null ||
+    !riskLevel ||
+    !scamType ||
+    !reasons
+  ) {
+    res.status(400).json({
+      success: false,
+      error: 'Missing required notification fields',
+    })
+    return
+  }
+
+  try {
+    await sendFamilyAlertEmail({
+      to,
+      userFullName,
+      riskScore,
+      riskLevel,
+      scamType,
+      reasons,
+      analyzedUrl,
+      elderlyExplanation,
+    })
+    res.json({
+      success: true,
+      message: 'Family notification email sent',
+    })
+  } catch (error) {
+    console.error('Family notification email error:', error)
+    res.status(500).json({
+      success: false,
+      error: 'Family notification email failed',
+    })
+  }
+})
+
+app.post('/api/analyze-url', async (req: Request, res: Response) => {
+  const rawUrl = req.body?.url
+  if (rawUrl === undefined || rawUrl === null || String(rawUrl).trim() === '') {
+    res.status(400).json({ error: 'No URL provided' })
+    return
+  }
+
+  const normalized = normalizeHttpUrlInput(rawUrl)
+  if (!normalized) {
+    res.status(400).json({ error: 'Invalid URL' })
+    return
+  }
+
+  try {
+    const payload = await analyzeUrlForQr(normalized)
+    res.json(payload)
+  } catch (error) {
+    console.error('analyze-url error:', error)
+    res.status(500).json({ error: 'URL analysis failed' })
+  }
+})
+
+app.post(
+  '/api/analyze',
+  upload.single('file'),
+  async (req: Request, res: Response) => {
+    if (!req.file) {
+      res.status(400).json({ error: 'No file uploaded' })
+      return
+    }
+    try {
+      const analysis = await analyzeScamImage(req.file.buffer, req.file.mimetype)
+      console.log('Gemini scam analysis completed')
+
+      const analysisResult = { ...analysis }
+      let reasons = filterWeakMisleadingReasons([...analysis.reasons])
+
+      const extractedUrls = analysisResult.extractedUrls ?? []
+      if (extractedUrls.length > 0) {
+        analysisResult.safeBrowsingResults =
+          await checkUrlsWithSafeBrowsing(extractedUrls)
+      }
+
+      const maliciousCount =
+        analysisResult.safeBrowsingResults?.filter((r) => r.status === 'malicious')
+          .length ?? 0
+
+      let riskScore = analysisResult.riskScore
+      let riskLevel = analysisResult.riskLevel
+
+      if (maliciousCount >= 1) {
+        riskLevel = 'Yüksek Risk'
+        if (maliciousCount >= 2) {
+          riskScore = Math.max(riskScore, 95)
+        } else {
+          riskScore = Math.max(riskScore, 85)
+        }
+        const safeBrowsingReason =
+          'Google Safe Browsing sistemi bu bağlantıyı zararlı/phishing olarak işaretledi.'
+        if (!reasons.includes(safeBrowsingReason)) {
+          reasons.push(safeBrowsingReason)
+        }
+      } else if (
+        shouldApplyCorporateTrustCap({
+          safeBrowsingResults: analysisResult.safeBrowsingResults,
+          extractedDomains: analysisResult.extractedDomains,
+          extractedUrls: analysisResult.extractedUrls,
+          scamType: analysis.scamType,
+          reasonsOriginal: analysis.reasons,
+          elderlyExplanation: analysisResult.elderlyExplanation,
+        })
+      ) {
+        const capped = applyCorporateTrustCap(riskScore)
+        riskScore = capped.riskScore
+        riskLevel = capped.riskLevel
+      }
+
+      riskLevel = syncRiskLevelFromScore(riskScore)
+
+      const scamTypeAdjusted = adjustScamTypeForBalancedAnalysis(
+        analysisResult.scamType,
+        riskLevel,
+        maliciousCount >= 1,
+      )
+
+      res.json({
+        ...analysisResult,
+        riskScore,
+        riskLevel,
+        reasons,
+        scamType: scamTypeAdjusted,
+      })
+    } catch (error) {
+      if (isGeminiQuotaOrRateLimitError(error)) {
+        res.status(200).json({
+          quotaExceeded: true,
+          message:
+            'AI analiz servisi şu anda yoğun. Lütfen biraz sonra tekrar deneyin.',
+        })
+        return
+      }
+      console.error('Gemini analysis error:', error)
+      res.status(500).json({
+        error: 'AI analysis failed',
+      })
+    }
+  },
+)
+
+app.listen(port, '0.0.0.0', () => {
+  console.log(`AI Scam Shield backend listening on http://0.0.0.0:${port}`)
+})
