@@ -1,5 +1,11 @@
-> ⚠️ This repository is a modified and renamed version of the original project:  
-> [ai_destekli_satis_asistani](https://github.com/nefisegll/ai_destekli_satis_asistani.git)
+<p align="center">
+⚠️ This repository is a modified and renamed version of the original project:<br/>
+<a href="https://github.com/nefisegll/ai_destekli_satis_asistani">
+ai_destekli_satis_asistani
+</a>
+</p>
+
+<br />
 
 <div align="center">
 
